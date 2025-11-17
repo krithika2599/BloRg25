@@ -1,0 +1,962 @@
+---
+title: "Q2-Capstone"
+author: "Krithika Subramani"
+date: "2025-11-02"
+output: html_document
+---
+
+<br> <br>
+
+# Research Question 2 <br> <br>
+
+***TASK*** <br>
+The task is to build a predictive algorithm using data from the first 24 hours of ICU admission. <br> <br>
+
+***OBJECTIVE*** <br>
+To evaluate whether routinely collected data in the first 24 hours in ICU can predict a prolonged ICU stay (≥7 days). <br> <br>
+
+***QUESTION*** <br> 
+Can patients at risk of a prolonged ICU stay (≥7 days) be accurately predicted from vital signs, laboratory results, and other early ICU features? <br> <br>
+
+***STUDY POPULATION*** <br>
+ MIMIC-III dataset (You will need to define your cohort e.g., ≥18 years old?, first ICU admission only? It doesn’t have to be the same as Question 1) <br> <br>
+
+# ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ <br> <br> 
+
+# Data Loading and Cleaning <br> <br>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, include = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(cobalt)
+library(compareGroups)
+```
+
+```{r data loading 1}
+# loading the icustays and patient related tables first
+patients <- read.csv('patients.csv')
+View(patients)
+
+icustays <- read.csv('icustays.csv')
+View(icustays)
+```
+
+Firstly, let's go ahead and check the `patients` table. Things to check for/ to do.... 
+
+* How many unique `subject_id`s
+* any duplicate entries
+* number of patients of each gender
+* number of expired patients
+* if `expire_flag` corresponds to the presence date of deaths 
+* factorise `expire_flag` and `gender`
+
+```{r patients}
+# total number of columns in the table
+dim(patients)
+summary(patients)
+```
+
+```{r}
+# getting the number of duplicate subject ids
+throwaway <- patients %>% count(subject_id) 
+throwaway %>% filter(n > 1)
+rm(throwaway)
+```
+
+```{r}
+# getting the count of male and female patients
+throwaway <- patients %>% count(gender)
+print(throwaway)
+
+# let's set the gender column as a factor
+patients <- patients %>% mutate(gender = factor(gender))
+str(patients$gender)
+summary(patients$gender)
+
+rm(throwaway)
+```
+
+```{r}
+# Assuming that the survival times are accurate, as mentioned in the capstone workbook (i.e., dob precedes dod/dod_hosp/dod_ssn in all cases)
+
+# getting the count of the expire_flags
+throwaway <- patients %>% count(expire_flag)
+print(throwaway)
+# 30761 living patients and 15759 expired patients
+
+# lets check if this corresponds with the dod columns
+# this is done mainly because the dods are obained from different sources, and may result in incorrect flags
+# setting flags based on the dates present in the dod columns
+patients <- patients %>% 
+  mutate(dod_flag = if_else(dod == "", 0, 1))
+
+patients <- patients %>% 
+  mutate(dod_hosp_flag = if_else(dod_hosp == "", 0, 1))
+
+patients <- patients %>% 
+  mutate(dod_ssn_flag = if_else(dod_ssn == "", 0, 1))
+
+# getting the final expired flag based on the previous flags
+patients <- patients %>% 
+  mutate(dod_count = dod_flag + dod_hosp_flag + dod_ssn_flag) %>% 
+  mutate(expired_final = if_else(dod_count >= 1, 1, 0))
+
+throwaway2 <- patients %>% count(expired_final)
+print(throwaway2) # 30761 living patients and 15759 expired patients
+
+# checking if the expire_flag and if the expired_final match
+patients <- patients %>% 
+  mutate(same = if_else(expire_flag == expired_final, 1, 0))
+
+throwaway3 <- patients %>% count(same)
+print(throwaway3) # they do match 
+
+# removing the throwaways and the flag columns from above
+rm(throwaway, throwaway2, throwaway3)
+patients <- patients %>% 
+  select(-dod_flag, -dod_hosp_flag, - dod_ssn_flag, -dod_count, -expired_final, -same)
+
+# factorising the expire_flag
+patients <- patients %>%
+  mutate(expire_flag = factor(expire_flag, levels = c(0,1), labels = c('Alive', 'Dead')))
+str(patients$expire_flag)
+summary(patients$expire_flag)
+```
+
+<br> <br>
+Findings from the `patients` table: <br> 
+
+The `patients` table has 8 variables and 46520 entries, with no duplicate `subject_id`. It is safe to conclude that there are a total of 46520 patients in this table. The dataset is made of 20399 female patients and 26121 male patients. There are 30761 living patients and 15759 expired patients. <br> <br>
+
+❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖    <br><br>
+
+Secondly, let's go ahead and check the `icustays` table. Things to check for/ to do.... 
+
+* duplicate entries, in terms of `icustay_id` (`icustay_id` must be unique)
+* select the last ICU visit per `hosp_id` and per `subject_id`
+* create a flag to indicate any extended ICU stay <br> <br>
+
+```{r icustays}
+dim(icustays)
+str(icustays)
+summary(icustays)
+```
+
+```{r}
+# checking for duplicate icustay_ids
+throwaway <- icustays %>% count(icustay_id) 
+throwaway %>% filter(n>1) # no duplicate ids
+
+rm(throwaway)
+```
+
+```{r}
+# selecting the last icu visit per subject_id
+# it seems that the icustay_id is randomly generated, and hence, i will be using the intime/ outtime to set the flags. 
+
+# let's first check the format of the intime/outtime columns
+str(icustays$intime)
+str(icustays$outtime)
+
+# from the summary table above, there were 10 entries with no outtime. 
+# let's go ahead and delete these, as we dont know when these patients were discharged, and hence we dont know how long their icu stay was
+sum(is.na(icustays$los))
+icustays <- icustays %>% filter(!is.na(los))
+dim(icustays)
+summary(icustays) # brings the number of entries down to 61522 from 61532
+
+# since both of these are characters, we need to change the format of it. 
+# this can be done using the lubridate library, hopefully
+icustays <- icustays %>% mutate(
+  intime = ymd_hms(intime),
+  outtime = ymd_hms(outtime))
+# sanity check
+str(icustays$intime)
+str(icustays$outtime)
+```
+
+```{r}
+# we can now go ahead and set the flags. 
+# setting 2 flags - one for last icu visit per hosp_id and the second flag for last icu visit per subject_id
+
+# used chatgpt to fix errors in my code
+icustays <- icustays %>%
+  group_by(hadm_id) %>%
+  mutate(last_icu_per_hospid = if_else(intime == max(intime), 1, 0)) %>%
+  ungroup() %>%
+  group_by(subject_id) %>%
+  mutate(last_icu_per_subjectid = if_else(intime == max(intime), 1, 0)) %>%
+  ungroup()
+
+# sanity check
+View(icustays)
+```
+
+```{r}
+# let's get the extended icu stay flag (7 or more days considered to be extended stay)
+icustays <- icustays %>% 
+  mutate(extended_icu_stay = if_else(los >= 7, 1, 0)) %>%
+  mutate(extended_icu_stay = factor(extended_icu_stay, labels = c('Stay less than 7 days', 'Stay of 7 days and more')))
+summary(icustays$extended_icu_stay)
+
+throwaway <- icustays %>% count(extended_icu_stay)
+print(throwaway)
+
+rm(throwaway) # 51643 short stays, 9879 long stays
+```
+
+```{r making icu_subject_id and icu_hosp_id}
+# let's get 2 new tables using the flags 
+icu_hosp_id <- icustays %>% 
+  filter(last_icu_per_hospid == 1) # results in 57776 icu stays (NOT PATIENTS)
+
+icu_subject_id <- icustays %>% 
+  filter(last_icu_per_subjectid == 1) # results in 46467 icu patient records
+```
+
+```{r}
+# final check to make sure that there are no duplicate subject_ids in icu_subject_id. 
+throwaway <- icu_subject_id %>% 
+  count(subject_id)
+
+throwaway <- throwaway %>% 
+  filter(n > 1)
+
+print(throwaway) # no duplicate subject_id
+
+rm(throwaway)
+```
+
+```{r}
+summary(icu_subject_id$extended_icu_stay)
+```
+
+The `icustays` table consists of 61522 ICU admission entries, and contains information regarding the type of wards, ICU in and out times, subject and hospital admission IDs etc. Each ICU admission has an unique `icustay_id`. The last ICU visit per `subject_id` has been flagged and their entries have been copied to a new table named `icu_subject_id`. <br>
+
+The `icu_subject_id` table consists of the last ICU admission entries for 46467 unique patients. I am choosing to use the last ICU admission per patient as per the paper 'Predicting Prolonged Length of ICU Stay through Machine Learning'. In this table, there are 38958 patients with a short stay (`los` < 7) and 7509 patients with an extended stay (`los` >= 7). <br> <br>
+
+❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖    <br><br>
+
+Thirdly, let's load the `pt_icu_outcome` table. As mentioned in the workbook, this table is combined using the above 2 tables ~ `patients` table and the `icustays` table. **In other words, it is safe to assume that the variable entries per record (e.g. subject id 345 will have the same icu `intime`, `outtime`, `los`, etc. and the same patient details like `dob`, `dod`, `expire_flag`, etc. for icu stay id 567 across the `pt_icu_outcome` table and the `icustays` table.** <br> <br>
+
+This table has some patient demographics that are not present in the `patient` table, like `age_years`. Probably advisable to copy such columns to the `patients` table, just to make sure that the demographics are in one place and match across 2 tables. <br>
+
+To conduct some of the data cleaning steps, it probably is easier to join the `icustays` table and `pt_icu_outcome` table, after dealing with the basic data cleaning. <br> <br>
+
+```{r data loading 2}
+pt_icu_outcome <- read.csv('pt_icu_outcome.csv')
+View(pt_icu_outcome)
+```
+
+```{r}
+dim(pt_icu_outcome) # 61533 records
+summary(pt_icu_outcome)
+```
+
+```{r}
+# let's go ahead and remove the 10 entries with los = NA
+pt_icu_outcome <- pt_icu_outcome %>% filter(!is.na(los))
+
+# sanity check
+dim(pt_icu_outcome) # 61523 records
+summary(pt_icu_outcome)
+
+# in the workbook, it has been mentioned that there is on duplicate for icustay_id 229922
+# lets check if there are other icustay_ids that have been duplicated
+throwaway <- pt_icu_outcome %>% count(icustay_id)
+throwaway %>% filter(n > 1) # it's just icustay_id 229922 that has been duplicated. 
+rm(throwaway)
+
+# let's go ahead and check what is up with this icustay_id
+pt_icu_outcome %>% filter(icustay_id == 229922) # subject id is 5246 and hadm_id is 199031
+
+# the entries are the same except for the admittime...let's cross check this with the admissions table's admit time
+admissions <- read.csv('admissions.csv')
+View(admissions)
+admissions %>% filter(subject_id == 5246 & hadm_id == 199031) # correct admittime is 2185-12-02 23:53:00
+
+# let's go ahead and remove the incorrect entry
+pt_icu_outcome <- pt_icu_outcome %>% filter(!(subject_id == 5246 & hadm_id == 199031 & admittime != '2185-12-02 23:53:00'))
+# sanity check
+dim(pt_icu_outcome) # 61522 entries
+pt_icu_outcome %>% filter(icustay_id == 229922)
+```
+
+```{r making icu_full}
+# let's go ahead and join the pt_icu_outcome and the icustays tables based on the icustay_id
+# opting for a left join as we want all the variables in the icustays table, and i want to add the additional columns from the pt_icu_outcome table
+throwaway <- pt_icu_outcome %>% select(-row_id, -subject_id, -hadm_id, -intime, -outtime, -los)
+print(throwaway)
+
+icu_full <- icustays %>% left_join(throwaway, by = "icustay_id")
+View(icu_full) # 61522 entries and 25 variables
+dim(icu_full)
+summary(icu_full)
+
+rm(throwaway)
+```
+
+Now that we have joined the tables... 
+
+Things to check/ to do... <br>
+
+* convert the date/ time (5 cols) variables to the right format
+* convert the flags to factors
+* fix the `hospital_expire_flag` NAs based on the same variable in the `admissions` table
+* reload the `icu_subject_id` and the `icu_hosp_id` tables to add the newer columns from the join
+
+```{r}
+# converting the data/ time cols
+icu_full <- icu_full %>% mutate(
+  dob = ymd_hms(dob),
+  admittime = ymd_hms(admittime),
+  dischtime = ymd_hms(dischtime),
+  hosp_deathtime = ymd_hms(hosp_deathtime),
+  dod = ymd_hms(dod)
+)
+
+icu_full <- icu_full %>% mutate(
+  dbsource = factor(dbsource),
+  first_careunit = factor(first_careunit),
+  last_careunit = factor(last_careunit),
+  last_icu_per_hospid = factor(last_icu_per_hospid, labels = c('no', 'yes')),
+  last_icu_per_subjectid = factor(last_icu_per_subjectid, labels = c('no', 'yes')),
+  icu_expire_flag = factor(icu_expire_flag, label = c('alive', 'expired')),
+  expire_flag = factor(expire_flag, label = c('alive', 'expired'))
+)
+
+# sanity check
+summary(icu_full)
+```
+
+<br> 
+
+Let's go ahead and get an updated `hospital_expire_flag` from the `admissions` table as the `hospital_expire_flag` in the `icu_full` table has 12338 NA's. The same variable in the `admissions` table seems to have a more complete column. This is understandable as the icu_full table was derived from the ICU stay related variables. If there was an in-hospital death that occurred outside of the ICU ward, it is likely that the the ICU tables will not record it. We can get the updated column by matching the `admission` table's `hospital_expire_flag` with the `hadm_id` in the `icu_full` table. <br> <br>
+
+```{r}
+adm <- admissions %>% select(hadm_id, hospital_expire_flag) %>%
+  # renaming the hospital_expire_flag so that we dont confuse it with the same variable in the icu table
+  rename(adm_hosp_expire_flag = hospital_expire_flag)
+print(adm)
+```
+
+```{r}
+# joining adm to the icu_full table
+# chatgpt suggested i add the coalesce function 
+icu_full <- icu_full %>% left_join(adm, by = 'hadm_id') %>% 
+  mutate (updated_hospital_expire_flag = coalesce(adm_hosp_expire_flag, hospital_expire_flag))
+
+# let's go ahead and factorise the updated_hospital_expire_flag
+icu_full <- icu_full %>% mutate (
+  updated_hospital_expire_flag = factor(updated_hospital_expire_flag, labels = c('alive', 'expired')),
+  adm_hosp_expire_flag = factor(adm_hosp_expire_flag, labels = c('alive', 'expired')))
+
+print(icu_full)
+rm(adm)
+```
+
+```{r refreshing icu_subject_id and icu_hosp_id}
+icu_hosp_id <- icu_full %>% 
+  filter(last_icu_per_hospid == 'yes') # results in 57776 icu stays (NOT PATIENTS)
+
+icu_subject_id <- icu_full %>% 
+  filter(last_icu_per_subjectid == 'yes') # results in 46467 icu patient records
+```
+
+```{r}
+summary(icu_subject_id)
+
+# the columns we need for analysis are subject_id, hadm_id, icustay_id, first_careunit, last_careunit, extended_icu_stay, age_years, icu_expire_flag, updated_hospital_expire_flag, expire_flag. 
+```
+
+```{r}
+# for easier accession from the following tables, let's make a copy of the hadm_id, icustay_id, and the subject_id columns from the icu_subject_id table. 
+# this is our preliminary cohort 
+# last hospital/ icu visit per patient
+
+ids1 <- icu_subject_id %>% select(subject_id, hadm_id, icustay_id)
+
+# lets also quickly make sure that every entry in each of the columns are unique
+throwaway <- ids1 %>% count(subject_id)
+throwaway %>% filter(n > 1)
+rm(throwaway) # no duplicates
+
+throwaway <- ids1 %>% count(hadm_id)
+throwaway %>% filter(n > 1)
+rm(throwaway) # no duplicates
+
+throwaway <- ids1 %>% count(icustay_id)
+throwaway %>% filter(n > 1)
+rm(throwaway) # no duplicates
+```
+
+❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖ ❖    <br><br>
+
+Now, let's load some of the clinical measurements, and take a quick look at them. I will be loading the `pt_weight.csv`, `icd9_diag.csv`, `pv_mechvent.csv`, `antibiotics.csv`, `bloodculture.csv`, `transfers.csv`, and the `vasopressors.csv` files in this round of data loading. <br> 
+
+```{r data loading 3}
+# let's import some of the non-hourly clinical measurements (non-hourly based on the file name, not the actual data)
+
+weight <- read.csv('pt_weight.csv')
+
+diagnosis <- read.csv('icd9_diag.csv')
+
+vent <- read.csv('pv_mechvent.csv')
+
+antibiotics <- read.csv('antibiotics.csv')
+
+blood <- read.csv('bloodculture.csv')
+
+transfers <- read.csv('transfers.csv')
+
+vaso <- read.csv('vasopressors.csv')
+```
+
+Starting with the `pt_weight.csv` table which was loaded as `weight` ~ <br> 
+
+```{r}
+print(weight)
+```
+```{r}
+# let's start by investigating the range of values in the dy column
+throwaway <- weight %>% count(dy)
+summary(throwaway) # the number of days where weight was measured go from 0-174
+rm(throwaway)
+```
+
+```{r weight}
+# lets go ahead and check if we have the weight at admission for per icustay_id
+throwaway <- weight %>% group_by(icustay_id) %>% filter(!is.na(admissionweight)) 
+view(throwaway)
+summary(throwaway$admissionweight) # some outliers present
+
+# making sure that each icustay_id exists once
+throw2 <- throwaway %>% count(icustay_id)
+throw2 %>% filter(n > 1)
+rm(throw2)
+
+# since a lot of the icustay_ids have multiple admissionweights, let's get the entry where dy is the minimum. 
+# assuming that the first admission weight recorded per icustay_id is recorded upon icu admission, moving forward
+throwaway <- throwaway %>% mutate(min_dy = if_else(dy == min(dy), 1, 0)) %>% filter(min_dy == 1)
+view(throwaway) # no duplicate icustay_ids now ; 43800 icustay_ids have an admission weight
+
+# let's go ahead and join the weight at admission for the entries in our icu_subject_id table
+throwaway <- throwaway %>% select(icustay_id, admissionweight)
+ids1 <- ids1 %>% left_join(throwaway, by = 'icustay_id')
+summary(ids1$admissionweight) # 14086 icustay_ids with NAs as admissionweight
+
+# since there are a good amount of NAs, let's check if these icustay_ids have a daily weight
+throwaway <- ids1 %>% filter(is.na(admissionweight)) %>% select(icustay_id)
+throwaway <- throwaway %>% left_join(weight, by = 'icustay_id')
+
+
+# creating a flag to indicate the first dailyweight entry per icustay_id
+# error corrected by chatgpt
+throwaway <- throwaway %>% group_by(icustay_id) %>% mutate(min_dy = if_else(!is.na(dailyweight) & dy == min(dy[!is.na(dailyweight)]), 1, 0))
+throwaway <- throwaway %>% filter(min_dy == 1) # 7400 (out of the 14086) icustay_ids with dailyweight
+summary(throwaway$dy) # first dailyweights are taken from 0 to up to day 60 of admission
+
+# let's go ahead and join this to the ids1 table
+throwaway <- throwaway %>% select(icustay_id, dailyweight)
+ids1 <- ids1 %>% left_join(throwaway, by = 'icustay_id')
+
+# joining the dailyweights and the admissionweights column to a general mixed_source_pt_weight
+# once joined, let's check how many icustay_ids still do not have a patient weight
+ids1 <- ids1 %>% mutate (mixed_source_pt_weight = coalesce(dailyweight, admissionweight))
+summary(ids1$mixed_source_pt_weight) # we still have 6686 patients without a weight
+
+# repeating the same process as above to get the avg_weight_naive
+throwaway <- ids1 %>% filter(is.na(mixed_source_pt_weight)) %>% select(icustay_id)
+throwaway <- throwaway %>% left_join(weight, by = 'icustay_id')
+throwaway <- throwaway %>% group_by(icustay_id) %>% mutate(min_dy = if_else(!is.na(avg_weight_naive) & dy == min(dy[!is.na(avg_weight_naive)]), 1, 0))
+throwaway <- throwaway %>% filter(min_dy == 1) 
+throwaway <- throwaway %>% select(icustay_id, avg_weight_naive)
+ids1 <- ids1 %>% left_join(throwaway, by = 'icustay_id')
+ids1 <- ids1 %>% mutate (mixed_source_pt_weight = coalesce(mixed_source_pt_weight, avg_weight_naive))
+summary(ids1$mixed_source_pt_weight) # there are still 5875 patients with no weights
+
+# repeating the same process as above to get the max_weight and or min_weight
+# none of the 5875 icustay_ids have a max_weight nor a min_weight
+throwaway <- ids1 %>% filter(is.na(mixed_source_pt_weight)) %>% select(icustay_id) # 5875 patients/ icustay_ids
+throwaway <- throwaway %>% left_join(weight, by = 'icustay_id')
+summary(throwaway$min_weight)
+# reached a wall here. 
+summary(throwaway)
+
+rm(throwaway)
+```
+
+In the `weight` table, there was a considerable amount of missingness across the different types of patient weights. I made the executive decision to consolidate 3 weight variables in a systematic manner for the `icustay_ids` in the `icu_subject_id` (and the `ids1` table by extension). Out of the 46,467 patient records in the `icu_subject_id`/`ids1` tables, 32,381 records had at least 1 `admissionweight` entry, and 14,086 patients did not. Out of this 14,086 patients, 7,400 patients had at least 1 `dailyweight` entry and 6,686 patients with no weights. From this 6,686 patients, 811 patients had at least 1 `avg_weight_naive`entry, leaving a final 5875 patients with no weight entries. The 5875 patients do not have `min_weight` and `max_weight` entries either. There are about 24 patients with a known `previousweight`, but we have no idea if it's currently the same. Hence, I have opted to not add the `previousweight` variable. <br> <br>
+
+As of now, 5875 out of the 46,467 patients in our preliminary cohort do not have a weight. The combined weights can be found in the `mixed_source_pt_weight` variable. <br> <br> 
+
+Next clinical measurement table we will be looking at is `icd9_diag.csv`, which was loaded as `diagnosis` ~ <br>
+
+```{r}
+print(diagnosis) # 651,047 entries
+```
+
+```{r}
+# let's check the range of seq_num
+throwaway <- diagnosis %>% count(seq_num)
+summary(throwaway) # there can be 1 - 39 icd9 diagnoses per patient
+```
+
+The ICD9 codes is a tough one, as we cannot simply select the first 3 or 4 diagnoses per patient to determine their stay in a real life application. The criticality of a patient's health status is a culmination of all the conditions they present...disregarding even one of the diagnoses may undermine the severity and the existing nuances of the patient's condition entirely. However, not all the patients will have 30+ ICD9 codes assigned to their case. In the interest of this project, I have opted to take the first 3 ICD9 codes for my algorithm. In doing this, I hope to maximise the number of patients in my cohort that will have the diagnoses (yikes!). <br>
+
+```{r diagnosis}
+# filtering the diagnosis table to only get the seq_num = 1, 2, 3
+throwaway <- diagnosis %>% filter(seq_num == 1 | seq_num == 2 | seq_num == 3) # 174982 entries
+
+# pivoting the data so that seq_num 1, 2, and 3 are presented as columns
+throwaway <- throwaway %>% 
+  select(hadm_id, seq_num, icd9_code) %>% 
+  pivot_wider(
+    names_from = seq_num,
+    values_from = icd9_code,
+    names_prefix = "diagnosis_") # diagnosis_2 has 374 NAs and diagnosis_3 has 1431 NAs
+
+# sanity check for the hadm_id, to make sure there are no duplicates
+t2 <- throwaway %>% count(hadm_id)
+t2 %>% filter(n > 1) 
+
+# the filtered table consists of 3 diagnoses in terms of ICD9 codes for 58,929 unique hadm_ids
+
+# before factorising the the diagnosis columns, let's check how many ICD9 codes we have in each
+t2 <- throwaway %>% count(diagnosis_1) # there are 2789 ICD9 codes in diagnosis_1
+t2 <- throwaway %>% count(diagnosis_2) # 2770 ICD9 codes 
+t2 <- throwaway %>% count(diagnosis_3) # 3038 ICD9 codes
+
+# probably advisable not to factorise them. 
+# let's join these diagnoses to the ids1 table
+# the usage of these columns can be determined later
+ids1 <- ids1 %>% left_join(throwaway, by = 'hadm_id')
+sum(is.na(ids1$diagnosis_1)) # 7 NAs for diagnosis_1
+sum(is.na(ids1$diagnosis_2)) # 291 NAs
+sum(is.na(ids1$diagnosis_3)) # 1186 NAs
+
+rm(throwaway, t2)
+```
+
+Upon filtering for 3 diagnoses per `hadm_id` and pivoting the resultant table, we got a final dataset consisting of 3 diagnose for 58,929 unique `hadm_ids`. `diagnosis_1` consisted of 2789 unique ICD9 codes and no NAs, `diagnosis_2` consisted of 2770 unique ICD9 codes with 374 NAs, and `diagnosis_3` consisted of 3038 unique ICD9 codes with 1431 NAs. <br.
+
+Once this table was joined with `ids1`, there were 7 patients with `diagnosis_1` as NA, 291 patients with `diagnosis_2` as NA, and 1186 patients with `diagnosis_3` as NA. <br> <br>
+
+Moving on to the `transfers.csv` table, which was loaded as `transfers` ~ <br>
+
+The aim of this table is to just get a flag of if the patient has been transferred across multiple departments during their stay.  <br>
+
+```{r}
+print(transfers)
+```
+
+From a quick look at the table, it is clear that I cannot use the `icustay_id` for my cleaning, due to the emptiness of it. By the looks of it, each admit-transfer-discharge chunk possibly belongs to each `icustay_id`. However, it is also possible for it to belong to a different `icustay_id`. A lot of the `admit` and `discharge` rows do not contain the care unit names either, which makes it hard to determine if the patient has been transferred across care units. <br> 
+
+That being said, I will be using the `first_careunit` and `last_careunit` columns from the `icu_subject_id` table (derived from the `icustays` table) to create a transfers flag. This is done under the assumption that the patients from the `icustays` table do not return to the ICU care unit they were first admitted to. In other words, a patient with `icustay_id` = 125 was first admitted to the MICU, gets transferred to the CCU, SICU etc., but the last care unit is not MICU. <br> <br>
+
+```{r transfers flag in icu_subject_id}
+icu_subject_id <- icu_subject_id %>% 
+  mutate (transfers_flag = if_else(first_careunit == last_careunit, 0, 1))
+```
+
+
+Let's look at the `antibiotics.csv` table now, which was loaded as `antibiotics` ~ <br> 
+
+```{r}
+print(antibiotics)
+```
+
+As mentioned in the workbook, I will be using his table to create a flag if an antibiotic, if any, was administered. To do this, I will be primarily using the `statusdescription` column to obtain a list of `icustay_id`s that were administered antibiotics. <br> 
+
+```{r antibiotics}
+summary(antibiotics) # 164,927 entries
+
+throwaway <- antibiotics %>% count(statusdescription)
+print(throwaway) # 31 empty status description, 159,220 FinishedRunning, 5676 Rewritten
+
+# let's go ahead and filter for the FinishedRunning
+throwaway <- antibiotics %>% filter(statusdescription == 'FinishedRunning') # 159,220 entries
+
+# creating the transfer_flag for each icustay_id present in the antibiotics table with at least 1 FinishedRunning
+throwaway <- throwaway %>% count(icustay_id) %>%
+  mutate(antibiotic_flag = if_else(n >= 1, 1, 0)) # there are 14,232 icustay_ids that were administered antibiotics
+
+# checking if icustay_ids are unique
+t2 <- throwaway %>% count(icustay_id)
+t2 %>% filter(n > 1) # no duplicate icustay_ids
+rm(t2)
+
+# let's join the transfer_flag to ids1
+throwaway <- throwaway %>% select(icustay_id, antibiotic_flag)
+ids1 <- ids1 %>% left_join(throwaway, by = 'icustay_id')
+summary(ids1$antibiotic_flag) # 35,802 patients do not have an antibiotic entry. 
+
+# it probably is safe to assume that these patients were not given antibiotics as their icustay_ids were not in the antibiotics table. 
+# lets go ahead and set the NAs as 0
+ids1 <- ids1 %>% mutate(antibiotic_flag = if_else((is.na(antibiotic_flag)), 0, antibiotic_flag)) %>% 
+  mutate(antibiotic_flag = factor(antibiotic_flag))
+summary(ids1$antibiotic_flag) # 10,665 patients were administered antibiotics, remaining 35,802 were not
+```
+
+The `antibiotics` table consisted of 164,927 entries, out of which 159,220 entries were described as `FinishedRunning`. This subset of entries were filtered out, and an `icustay_id` count was conducted, which resulted in 14,232 `icustay_id`s that had antibiotics administered to them. A flag was created, and the flag was left-joined to the `ids1` table (our preliminary cohort, same identifiers as `icu_subject_id`). In our preliminary cohort, 10,665 patients were administered antibiotics, and the remaining 35,802 patients did not receive any antibiotics. The antibiotics flag is named as `antibiotic_flag` and is currently in the `ids1` table. <br> <br>
+
+Moving on to the `bloodcultures.csv` table, which is loaded as `blood` ~ <br>
+
+```{r}
+print(blood) #632,506 entries
+summary(blood)
+```
+
+I'm not sure how helpful this table would be ~ but lets check. Starting off by how many `icustay_id`s have had a blood test taken on their first day at the ICU...  <br> If there is not a considerable amount (~ 30k - 40k) of `icustay_id`s with a day 1 blood test that is taken after the patient has been admitted to the icu (`hr` should not e negative), it's better to skip using this table. 
+
+```{r blood}
+throwaway <- blood %>% filter(dy == 1 & hr >= 0) %>% count(icustay_id)
+print(throwaway) # there are 29,614 icustay_ids with day 1 blood tests
+
+throwaway <- blood %>% filter(dy == 1 & hr >= 0)
+# let's factorise the positiveculture column, and get a summary table to see what variables we can use. 
+throwaway <- throwaway %>% mutate(positiveculture = factor(positiveculture))
+summary(throwaway)
+
+# let's check how many possible bacteria names can be tested for
+t2 <- throwaway %>% count(org_name) # 185 possible bacterium, and 1 empty field
+
+# let's also check how the range of the number of bacterium that is checked for per icustay_id
+# my code was not working the way i wanted, so i used chatgpt
+t2 <- throwaway %>%
+  group_by(icustay_id) %>%
+  summarise(unique_org_count = n_distinct(org_name, na.rm = TRUE)) %>%
+  ungroup()
+summary(t2) # ranges from 1 - 14 bacterium tests per person. 
+
+```
+
+<font color = 'red'> COME BACK TO THE BLOOD CULTURES TABLE </font> <br> <br>
+
+Let's look at the `vasopressors.csv` table, which was loaded as `vaso` ~ <br> 
+
+```{r}
+print(vaso) #314,964 entries
+summary(vaso)
+```
+
+In the workbook, it has been mentioned that the prescription of vasopressors indicates cardiac organ failure. Hence, this data can be used to create flag based columns. This flag will indicate if the patient indicated signs of cardiac organ failure in the first 24 hours of being admitted in the ICU. To do that, we first need to convert the `starttime` and `endtime` column to the date/ time format, and compare it with the `intime` for a given `icustay_id`. I have opted to create drug-based flags. For example, if an `icustay_id` has norepinephrine administered in the first 24 hours, the `norepi_flag` will be set to 1. <br> <br>
+
+```{r vasopressors}
+# converting the times to the right format
+vaso <- vaso %>% mutate(
+  starttime = ymd_hms(starttime),
+  endtime = ymd_hms(endtime)
+)
+```
+
+Upon taking a quick look at the table, there seems to be a few issues ~
+
+* A significant portion of the entries do not have a valid `endtime`, which means we do not know when the drug administration was stopped.
+* NA `endtime` entries are often coupled with 0/NA drug rate/amounts <br> 
+
+I am planning to tackle this by... 
+
+1. filtering to select the entries with a non-NA `starttime` and `endtime`
+2. going drug by drug, and creating a general drug flag for the entries with drug_rate and drug_amount > 0
+3. for entries with general drug flag = 1, checking if the `starttime` - `intime` (ICU entry time) is lesser than 24 hours. If it is, drug_24hrs_flag will be set to 1. <br> <br>
+
+
+```{r vaso drug flags}
+# retaining entries with non-NA start and end times
+throwaway <- vaso %>% filter(!is.na(starttime) & !is.na(endtime)) # down to 83,779 entries of 4070 unique icustay_ids
+
+# getting the ICU intime from the icu_subject_id table into the vaso
+t2 <- icu_subject_id %>% select(icustay_id, intime)
+
+# joining this to the throwaway table consisting of vaso entries
+throwaway <- throwaway %>% left_join(t2, by = 'icustay_id') # any NAs indicate that those icustay_ids were not in the icu_subject_id table
+
+# flagging the entries where starttime is within the first 24 hours of the patient being in the ICU
+throwaway <- throwaway %>% mutate(starttime_minus_intime = starttime - intime) %>% 
+  # difference between the time is presented in seconds, hence im doing 24hrs * 60mins * 60secs
+  # adding a 0 < starttime_minus_intime condition, if in case the vasos were administered even before the patient was admitted into the ICU
+  mutate(vaso_24hrs = if_else(0 < starttime_minus_intime & starttime_minus_intime <= (24*60*60), 1, 0))
+
+# there are entries where either the rate or amount of the drug has a 0 value. 
+# in this case, it would be better to set a flag based on rate and amount > 0
+throwaway <- throwaway %>% mutate(
+  norepi_flag = if_else(norepinephrine_rate > 0 & norepinephrine_amount > 0, 1, 0),
+  epi_flag = if_else(epinephrine_rate > 0 & epinephrine_amount > 0, 1, 0),
+  dopa_flag = if_else(dopamine_rate > 0 & dopamine_amount > 0, 1, 0),
+  dobuta_flag = if_else(dobutamine_rate > 0 & dobutamine_amount > 0, 1, 0) 
+) # any NAs in these columns refer to the patients not being administered the drug. hence, it can be converted to 0 later. 
+
+# filtering for the entries with drugs administered in the first 24 hours, based on the vaso_24hrs flag
+throwaway <- throwaway %>% filter(vaso_24hrs == 1) # down to 21,060 entries consisting of 2571 unique icustay_ids
+
+# also, icustay_ids have been administered more than 1 dose of the same drugs in the first 24 hours, which has led to multiple rows per icustay_id
+# let's create a flag where if an icustay_id has atleast one entry of drug_flag = 1, its corresponding drug_24hrs_flag will be set to 1
+# chatgpt was used to fix the errors in my code
+t2 <- throwaway %>% group_by(icustay_id) %>%
+  summarise(norepi_24hrs_flag = as.integer(any(norepi_flag == 1, na.rm = TRUE)),
+            epi_24hrs_flag = as.integer(any(epi_flag == 1, na.rm = TRUE)),
+            dopamine_24hrs_flag = as.integer(any(dopa_flag == 1, na.rm = TRUE)),
+            dobutamine_24hrs_flag = as.integer(any(dobuta_flag == 1, na.rm = TRUE))) %>%
+  ungroup()
+
+summary(t2)
+
+# let's go ahead and join this to ids1
+ids1 <- ids1 %>% left_join(t2, by = 'icustay_id')
+summary(ids1) # 43,896 NAs in the 4 drug flags
+
+# it is safe to assume that the icustay_ids were not administered any vasopressors and hence, these NAs can be set to 0
+ids1 <- ids1 %>% mutate(
+            norepi_24hrs_flag = replace_na(norepi_24hrs_flag, 0),
+            epi_24hrs_flag = replace_na(epi_24hrs_flag, 0),
+            dopamine_24hrs_flag = replace_na(dopamine_24hrs_flag, 0),
+            dobutamine_24hrs_flag = replace_na(dobutamine_24hrs_flag, 0))
+summary(ids1)
+
+# let's go ahead and factorise these vaso flags
+ids1 <- ids1 %>% mutate(
+  norepi_24hrs_flag = factor(norepi_24hrs_flag),
+  epi_24hrs_flag = factor(epi_24hrs_flag),
+  dopamine_24hrs_flag = factor(dopamine_24hrs_flag),
+  dobutamine_24hrs_flag = factor(dobutamine_24hrs_flag))
+  
+rm(throwaway, t2)
+```
+
+The `vaso` table consisted of 314,964 entries for 8379 unique `icustay_id`s. Filtering to retain entries with non-NA `starttime` and `endtime` brought the number of entries down to 83,779 entries (4070 unique `icustay_id`s). Out of this subset, 21,060 entries consisting of 2571 unique `icustay_id`s were administered vasopressors within the first 24 hours of being admitted into the ICU. The drug based flags were made, and were joined to the `ids1` table. <br> <br>
+
+Moving on to the `pt_mechvent.csv` table, which was loaded as `vent` ~ 
+
+```{r}
+print(vent) # 694,959 entries of 14,339 unique icustay_ids
+summary(vent)
+```
+From the data available, we could get 2 potential variables for our final dataset. <br>
+
+1. A flag, indicating if the patient needed mechanical ventilation in their first 24 hours in the ICU
+2. Getting the mean PEEP value per `icustay_id` <br> <br>
+
+```{r mechvent flag and peep}
+# let's start by joining the intime from the icu_subject_id table
+throwaway <- icu_subject_id %>% select(icustay_id, intime)
+t2 <- vent %>% left_join(throwaway, by = 'icustay_id')
+
+# filtering the rows corresponding to the icustay_ids from the icu_subject_id table
+t2 <- t2 %>% filter(icustay_id %in% throwaway$icustay_id) # 543,382 entries of 11,191 unique icustay_ids from the icu_subject_id table
+
+# converting the starttime, endtime, charttimeto the right format
+t2 <- t2 %>% mutate(
+  starttime = ymd_hms(starttime),
+  endtime = ymd_hms(endtime),
+  charttime = ymd_hms(charttime))
+
+# let's go ahead and filter the rows based on their starttime being within 24 hours of ICU admission and create the flag
+vent_flag <- t2 %>% filter(starttime <= intime + hours(24)) %>%
+  group_by(icustay_id) %>%
+  summarise(on_vent_24h = 1) # consists of 10,383 unique icustay_ids
+
+# joining this to the ids1 table
+ids1 <- ids1 %>% left_join(vent_flag, by = 'icustay_id')
+
+# it is safe to assume that the patient with NAs were not on mechanical ventilation, so we can set the NAs to be 0
+ids1 <- ids1 %>% mutate(on_vent_24h = replace_na(on_vent_24h, 0)) %>%
+  # factoring the flag as well
+  mutate(on_vent_24h = factor(on_vent_24h))
+summary(ids1$on_vent_24h) # 10,383 patients on mechanical ventilation in their first 24hours, 36,084 patients were not
+
+
+# let's get the mean PEEP value per icustay_id
+vent_peep <- t2 %>% filter(charttime <= intime + hours(24)) %>%
+  group_by(icustay_id) %>%
+  summarise(vent_mean_peep = mean(setpeep, na.rm = TRUE)) # 10,352 unique icustay_ids
+
+# let's go ahead and join this to the ids1 table
+ids1 <- ids1 %>% left_join(vent_peep, by = 'icustay_id') 
+summary(ids1$vent_mean_peep) # cannot set the NAs to. 0 in this case as it would mean that peep = 0, and not that there was missing info
+# not sure if this column can be used for the regression model due to it's missingness, but adding it anyway for the time being as PEEP is an important variable
+
+rm(throwaway, t2, vent_peep, vent_flag)
+```
+
+The `vent` table started with 694,959 entries belonging to 14,339 unique `icustay_id`s. When filtered to only retain the `icustay_id`s from the `icu_subject_id` table, the resultant table consisted of 543,382 entries of 11,191 unique `icustay_id`s from the `icu_subject_id` table. When creating the `on_vent_24h` flag, there were 10,383 `icustay_id`s that were on mechanical ventilation out of the 11,191. When creating the `vent_mean_peep` variable, 10,352 patients had valid `setpeep` entries, with `charttime` within the first 24 hours of the ICU admission `intime`. <br> <br>
+
+Let's go ahead and load the hourly data. Due to the large size of these data, I will be filtering the `icustay_id`s that are in the `icu_subject_id` table out first, and working on them ~ <br> 
+
+```{r data loading 4}
+# let's import some of the hourly data
+vitals_raw <- read.csv('vitals_hourly.csv') # 7,292,362 entries
+
+gcs_raw <- read.csv('gcs_hourly.csv') # 1,515,342 entries
+
+labs_raw <- read.csv('labs_hourly.csv') # 928,195 entries
+
+fluid_raw <- read.csv('output_hourly.csv') # 3,325,543 entries
+```
+
+```{r data loading 4 - filtered}
+throwaway <- ids1 %>% select(icustay_id)
+
+vitals <- vitals_raw %>% filter(icustay_id %in% throwaway$icustay_id)
+View(vitals) # 5,594,625 entries
+
+gcs <- gcs_raw %>% filter(icustay_id %in% throwaway$icustay_id)
+View(gcs) # 1,070,579 entries
+
+labs <- labs_raw %>% filter(icustay_id %in% throwaway$icustay_id)
+View(labs) # 669,843 entries
+
+fluid <- fluid_raw %>% filter(icustay_id %in% throwaway$icustay_id)
+View(fluid) # 2,371,093 entries
+```
+
+Starting with the investigation of `vitals_hourly.csv`, which was loaded as `vitals` ~ <br> 
+
+```{r}
+print(vitals)
+summary(vitals)
+```
+
+
+```{r}
+# let's start by filtering for entries between hr 1 and 24
+throwaway <- vitals %>% filter(hr <= 24) # down to 1,008,378 entries
+
+# grouping the entries based on icustay_id and hr
+throwaway <- throwaway %>% group_by(icustay_id, hr)
+summary(throwaway)
+```
+
+From a brief look at the summary table, there seems to be a significant amount of missing data, especially in the `fio2` and the `glucose` columns. It would be difficult to impute these columns, and hence, I will be skipping them. <br>
+
+Let's start with the `spo2` column. I plan on making 2 variables using `spo2` ~
+
+1. Average SpO2 value over the first 24 hours
+2. If the patient has had an SpO2 reading lesser than [92%](https://www.cmihealth.com/blogs/news/understanding-pulse-oximeter-metrics-what-your-oxyknight®-fingertip-oximeter-readings-mean?srsltid=AfmBOoowfy7mqf_h1gYN-NUM0SJNw4urCEQl_NMY8mRBgeN8qJe-Suzv) flag
+
+I am choosing to add a flag as sometimes the mean might not indicate any low blood oxygenation events that may have happened in the first 24 hours. <br> <br>
+
+```{r vitals hourly - spo2}
+# starting by getting the mean
+t2 <- throwaway %>% group_by(icustay_id) %>% 
+  summarise(mean_SpO2 = mean(spo2, na.rm = TRUE)) %>% 
+  ungroup()
+summary(t2) # about 5863 patients do not have any spo2 readings
+
+# joining this to ids1
+ids1 <- ids1 %>% left_join(t2, by = 'icustay_id')
+
+# getting a flag for low_spo2_flag
+t2 <- throwaway %>% group_by(icustay_id) %>% 
+  summarise(low_spo2_flag = as.integer(any(spo2 < 92, na.rm = TRUE))) %>% 
+  ungroup()
+
+# joining to ids1
+ids1 <- ids1 %>% left_join(t2, by = 'icustay_id')
+```
+
+Moving on to the `temperature` column ~ 
+
+Like the `spo2` column, I will be making a `mean_temp` variable, and a flag which indicates if the patient had a temperature of above 38.0°C, indicating a fever. <br> <br>
+
+```{r vitals hourly - temperature}
+# starting by getting the mean
+t2 <- throwaway %>% group_by(icustay_id) %>% 
+  summarise(mean_temp = mean(temperature, na.rm = TRUE)) %>% 
+  ungroup()
+summary(t2) # about 9278 patients do not have any temp readings
+
+# joining this to ids1
+ids1 <- ids1 %>% left_join(t2, by = 'icustay_id')
+
+# getting a flag for fever
+t2 <- throwaway %>% group_by(icustay_id) %>% 
+  summarise(fever_flag = as.integer(any(temperature > 38, na.rm = TRUE))) %>% 
+  ungroup()
+
+# joining to ids1
+ids1 <- ids1 %>% left_join(t2, by = 'icustay_id')
+
+summary(ids1$mean_temp)
+summary(ids1$fever_flag)
+```
+
+Next, the `resprate` column, which is the number of breaths taken by the patient per minute. [The normal respiratory rate falls around 14-20 breaths per minute and anything above 24 breaths per minute can be classified as critically ill.](https://www.mja.com.au/journal/2008/188/11/respiratory-rate-neglected-vital-sign) Like `spo2` and `temperature`, I will be making 2 columns - `mean_resprate` and `high_resprate_flag`. <br> 
+
+```{r vitals hourly - resprate}
+# starting by getting the mean
+t2 <- throwaway %>% group_by(icustay_id) %>% 
+  summarise(mean_resprate = mean(resprate, na.rm = TRUE)) %>% 
+  ungroup()
+summary(t2) # about 8491 patients do not have any respiratory rate readings
+
+# joining this to ids1
+ids1 <- ids1 %>% left_join(t2, by = 'icustay_id')
+
+# getting a flag for high resprate
+t2 <- throwaway %>% group_by(icustay_id) %>% 
+  summarise(high_resprate_flag = as.integer(any(resprate > 24, na.rm = TRUE))) %>% 
+  ungroup()
+
+# joining to ids1
+ids1 <- ids1 %>% left_join(t2, by = 'icustay_id')
+
+summary(ids1$mean_resprate)
+summary(ids1$high_resprate_flag)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
